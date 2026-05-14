@@ -33,13 +33,62 @@ export interface SmartConnectionsData {
 }
 
 /**
+ * Detect the actual active embedding model by counting which model key
+ * has the most entries across all .ajson files. This is more reliable than
+ * trusting smart_env.json.model_key, which Smart Connections plugin can
+ * overwrite when saving other settings (e.g. folder exclusions).
+ *
+ * Patch added 2026-05-15: plugin overwrites model_key on every settings save,
+ * so we detect from .ajson directly to ensure we always use the latest reindex.
+ */
+function detectActiveModelKey(smartEnvPath: string): string | null {
+  const multiPath = path.join(smartEnvPath, 'multi');
+  if (!fs.existsSync(multiPath)) return null;
+
+  const files = fs.readdirSync(multiPath).filter(f => f.endsWith('.ajson'));
+  const keyCounts: Record<string, number> = {};
+
+  for (const file of files) {
+    const filePath = path.join(multiPath, file);
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      // Scan for "modelKey":{"vec" patterns without full JSON parse (faster)
+      const matches = content.match(/"([^"]{5,80})":\{"vec"/g) || [];
+      for (const match of matches) {
+        const key = match.replace(/^"|":\{"vec"$/, '').replace(/^"/, '');
+        keyCounts[key] = (keyCounts[key] || 0) + 1;
+      }
+    } catch { /* skip unparseable files */ }
+  }
+
+  if (Object.keys(keyCounts).length === 0) return null;
+
+  // Pick the model key with the most entries (= most recently reindexed)
+  return Object.entries(keyCounts).sort(([, a], [, b]) => b - a)[0][0];
+}
+
+/**
  * Load Smart Connections data from the vault's .smart-env directory.
  */
 export function loadSmartConnectionsData(config: Config): SmartConnectionsData {
   const smartEnvPath = path.join(config.resolvedVaultPath, '.smart-env');
 
-  // Load model info from smart_env.json
-  const modelInfo = loadModelInfo(smartEnvPath);
+  // Load model info from smart_env.json (base config)
+  let modelInfo = loadModelInfo(smartEnvPath);
+
+  // Detect actual active model from .ajson entry counts —
+  // overrides smart_env.json when plugin has overwritten it with a stale value.
+  const detectedKey = detectActiveModelKey(smartEnvPath);
+  if (detectedKey && detectedKey !== modelInfo.modelKey) {
+    log('INFO', 'model_key_auto_detected', {
+      fromConfig: modelInfo.modelKey,
+      fromAjson: detectedKey,
+      reason: '.ajson has more entries for detected key — using it',
+    });
+    const dimensions = getModelDimensions(detectedKey);
+    modelInfo = { modelKey: detectedKey, dimensions, adapter: 'transformers' };
+  }
+
   log('INFO', 'model_loaded', { modelKey: modelInfo.modelKey, dimensions: modelInfo.dimensions });
 
   // Load embeddings from multi/*.ajson files
@@ -116,6 +165,16 @@ function getModelDimensions(modelKey: string): number {
     'BAAI/bge-small-en-v1.5': 384,
     'BAAI/bge-base-en-v1.5': 768,
     'BAAI/bge-large-en-v1.5': 1024,
+    // Multilingual / Chinese (added 2026-05-14 for cross-lingual vault)
+    'BAAI/bge-m3': 1024,
+    'intfloat/multilingual-e5-small': 384,
+    'intfloat/multilingual-e5-base': 768,
+    'intfloat/multilingual-e5-large': 1024,
+    // Xenova ONNX forks (transformers.js 用的, Smart Connections plugin 实际 load 这些)
+    'Xenova/multilingual-e5-small': 384,
+    'Xenova/multilingual-e5-base': 768,
+    'Xenova/bge-small-en-v1.5': 384,
+    'Xenova/bge-base-en-v1.5': 768,
   };
 
   const dimensions = knownModels[modelKey];
