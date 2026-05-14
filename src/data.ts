@@ -52,10 +52,14 @@ function detectActiveModelKey(smartEnvPath: string): string | null {
     const filePath = path.join(multiPath, file);
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
-      // Scan for "modelKey":{"vec" patterns without full JSON parse (faster)
-      const matches = content.match(/"([^"]{5,80})":\{"vec"/g) || [];
-      for (const match of matches) {
-        const key = match.replace(/^"|":\{"vec"$/, '').replace(/^"/, '');
+      // Scan for "modelKey":{"vec" patterns without full JSON parse (faster).
+      // Bug-fix 2026-05-15: original used `match()` + `replace(/^"|...$/, '')` which
+      // only stripped leading `"` (alternation without /g), leaving trailing
+      // `":{"vec"` glued to the key. Use matchAll() with capture group instead.
+      for (const m of content.matchAll(/"([^"]{5,80})":\{"vec"/g)) {
+        const key = m[1];
+        // Only accept HuggingFace-style model ids ("org/name"), reject garbage
+        if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(key)) continue;
         keyCounts[key] = (keyCounts[key] || 0) + 1;
       }
     } catch { /* skip unparseable files */ }
